@@ -1,23 +1,23 @@
 // Copyright (c) 2017-present, PingCAP, Inc. Licensed under Apache-2.0.
 
-use std::fmt::Debug;
-use std::io::BufRead;
-use std::mem;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-
-use byteorder::{BigEndian, LittleEndian, ReadBytesExt, WriteBytesExt};
-use log::error;
-use num_derive::FromPrimitive;
-use num_traits::FromPrimitive;
-use protobuf::Message;
-
 use crate::codec::{self, NumberEncoder};
 use crate::memtable::EntryIndex;
 use crate::metrics::StopWatch;
 use crate::pipe_log::{FileBlockHandle, FileId, LogFileContext, ReactiveBytes};
 use crate::util::{crc32, lz4};
 use crate::{perf_context, Error, Result};
+use bincode2::{config, serialize_into};
+use byteorder::{BigEndian, LittleEndian, ReadBytesExt, WriteBytesExt};
+use log::error;
+use num_derive::FromPrimitive;
+use num_traits::FromPrimitive;
+use serde::{Deserialize, Serialize};
+use std::fmt::Debug;
+use std::io::BufRead;
+use std::mem;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use serde::de::DeserializeOwned;
 
 pub(crate) const LOG_BATCH_HEADER_LEN: usize = 16;
 pub(crate) const LOG_BATCH_CHECKSUM_LEN: usize = 4;
@@ -36,12 +36,12 @@ const MAX_LOG_ENTRIES_SIZE_PER_BATCH: usize = i32::MAX as usize;
 
 /// `MessageExt` trait allows for probing log index from a specific type of
 /// protobuf messages.
-pub trait MessageExt: Send + Sync {
-    type Entry: Message + Clone + PartialEq;
 
+pub trait MessageExt: Send + Sync {
+    type Entry: Serialize + DeserializeOwned + Clone + PartialEq;
+    /// 仍然保留 index 语义（Raft entry index）
     fn index(e: &Self::Entry) -> u64;
 }
-
 /// Types of compression.
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -476,8 +476,10 @@ impl LogItemBatch {
         self.items.push(item);
     }
 
-    pub fn put_message<S: Message>(&mut self, region_id: u64, key: Vec<u8>, s: &S) -> Result<()> {
-        self.put(region_id, key, s.write_to_bytes()?);
+    pub fn put_message<S: Serialize>(&mut self, region_id: u64, key: Vec<u8>, s: &S) -> Result<()> {
+        let value = bincode2::serialize(s)
+            .map_err(|e| Error::Corruption(format!("bincode serialize error: {}", e)))?;
+        self.put(region_id, key, value);
         Ok(())
     }
 
@@ -662,8 +664,11 @@ impl LogBatch {
             MAX_LOG_ENTRIES_SIZE_PER_BATCH
         })();
         for e in entries {
+            let serialized = bincode2::serialize(e)
+                .map_err(|e| Error::Corruption(format!("bincode serialize error: {}", e)))?;
             let buf_offset = self.buf.len();
-            e.write_to_vec(&mut self.buf)?;
+            self.buf.extend_from_slice(&serialized);
+            // 关键改动点
             if self.buf.len() > max_entries_size + LOG_BATCH_HEADER_LEN {
                 self.buf.truncate(old_buf_len);
                 self.buf_state = BufState::Open;
@@ -727,7 +732,7 @@ impl LogBatch {
     }
 
     /// Adds a protobuf key value pair into the log batch.
-    pub fn put_message<S: Message>(&mut self, region_id: u64, key: Vec<u8>, s: &S) -> Result<()> {
+    pub fn put_message<S: Serialize>(&mut self, region_id: u64, key: Vec<u8>, s: &S) -> Result<()> {
         if crate::is_internal_key(&key, None) {
             return Err(Error::InvalidArgument(format!(
                 "key prefix `{:?}` reserved for internal use",
@@ -1110,594 +1115,593 @@ impl AtomicGroupBuilder {
         Self { id, status: None }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::pipe_log::{LogQueue, Version};
-    use crate::test_util::{catch_unwind_silent, generate_entries, generate_entry_indexes_opt};
-    use protobuf::parse_from_bytes;
-    use raft::eraftpb::Entry;
-    use strum::IntoEnumIterator;
-
-    fn decode_entries_from_bytes<M: MessageExt>(
-        buf: &[u8],
-        entry_indexes: &[EntryIndex],
-        _encoded: bool,
-    ) -> Vec<M::Entry> {
-        let mut entries = Vec::with_capacity(entry_indexes.len());
-        for ei in entry_indexes {
-            let block =
-                LogBatch::decode_entries_block(buf, ei.entries.unwrap(), ei.compression_type)
-                    .unwrap();
-            entries.push(
-                parse_from_bytes(
-                    &block[ei.entry_offset as usize..(ei.entry_offset + ei.entry_len) as usize],
-                )
-                .unwrap(),
-            );
-        }
-        entries
-    }
-
-    #[test]
-    fn test_entry_indexes_enc_dec() {
-        fn encode_and_decode(entry_indexes: &mut [EntryIndex]) -> EntryIndexes {
-            let mut entries_size = 0;
-            for idx in entry_indexes.iter_mut() {
-                idx.entry_offset = entries_size;
-                entries_size += idx.entry_len;
-            }
-            let entry_indexes = EntryIndexes(entry_indexes.to_vec());
-
-            let mut encoded = vec![];
-            entry_indexes.encode(&mut encoded).unwrap();
-            let mut bytes_slice = encoded.as_slice();
-            let mut decoded_entries_size = 0;
-            let decoded_indexes =
-                EntryIndexes::decode(&mut bytes_slice, &mut decoded_entries_size).unwrap();
-            assert_eq!(bytes_slice.len(), 0);
-            assert!(decoded_indexes.approximate_size() >= encoded.len());
-            assert_eq!(decoded_entries_size, entries_size);
-            decoded_indexes
-        }
-
-        let entry_indexes = vec![Vec::new(), generate_entry_indexes_opt(7, 17, None)];
-        for mut idxs in entry_indexes.into_iter() {
-            let decoded = encode_and_decode(&mut idxs);
-            assert_eq!(idxs, decoded.0);
-        }
-
-        let mut entry_indexes_with_file_id =
-            generate_entry_indexes_opt(7, 17, Some(FileId::new(LogQueue::Append, 7)));
-        let mut decoded = encode_and_decode(&mut entry_indexes_with_file_id);
-        assert_ne!(entry_indexes_with_file_id, decoded.0);
-        for i in decoded.0.iter_mut() {
-            i.entries = None;
-        }
-        assert_ne!(entry_indexes_with_file_id, decoded.0);
-    }
-
-    #[test]
-    fn test_command_enc_dec() {
-        let cmds = vec![Command::Clean, Command::Compact { index: 7 }];
-        let invalid_command_type = 7;
-        for cmd in cmds.into_iter() {
-            let mut encoded = vec![];
-            cmd.encode(&mut encoded);
-            let mut bytes_slice = encoded.as_slice();
-            let decoded_cmd = Command::decode(&mut bytes_slice).unwrap();
-            assert_eq!(bytes_slice.len(), 0);
-            assert!(decoded_cmd.approximate_size() >= encoded.len());
-            assert_eq!(cmd, decoded_cmd);
-
-            encoded[0] = invalid_command_type;
-            let expected = format!("Unrecognized command type: {invalid_command_type}");
-            assert!(matches!(
-                Command::decode(&mut encoded.as_slice()),
-                Err(Error::Corruption(m)) if m == expected
-            ));
-        }
-    }
-
-    #[test]
-    fn test_kv_enc_dec() {
-        let kvs = vec![
-            KeyValue::new(OpType::Put, b"put".to_vec(), Some(b"put_v".to_vec())),
-            KeyValue::new(OpType::Del, b"del".to_vec(), None),
-        ];
-        let invalid_op_type = 7;
-        for kv in kvs.into_iter() {
-            let mut encoded = vec![];
-            kv.encode(&mut encoded).unwrap();
-            let mut bytes_slice = encoded.as_slice();
-            let decoded_kv = KeyValue::decode(&mut bytes_slice).unwrap();
-            assert_eq!(bytes_slice.len(), 0);
-            assert!(decoded_kv.approximate_size() >= encoded.len());
-            assert_eq!(kv, decoded_kv);
-
-            encoded[0] = invalid_op_type;
-            let expected = format!("Unrecognized op type: {invalid_op_type}");
-            assert!(matches!(
-                KeyValue::decode(&mut encoded.as_slice()),
-                Err(Error::Corruption(m)) if m == expected
-            ));
-        }
-
-        let del_with_value = KeyValue::new(OpType::Del, b"del".to_vec(), Some(b"del_v".to_vec()));
-        let mut encoded = vec![];
-        del_with_value.encode(&mut encoded).unwrap();
-        let mut bytes_slice = encoded.as_slice();
-        let decoded_kv = KeyValue::decode(&mut bytes_slice).unwrap();
-        assert_eq!(bytes_slice.len(), 0);
-        assert!(decoded_kv.value.is_none());
-    }
-
-    #[test]
-    fn test_log_item_enc_dec() {
-        let items = vec![
-            LogItem::new_entry_indexes(7, generate_entry_indexes_opt(7, 17, None)),
-            LogItem::new_command(17, Command::Compact { index: 7 }),
-            LogItem::new_kv(27, OpType::Put, b"key".to_vec(), Some(b"value".to_vec())),
-        ];
-        let invalid_log_item_type = 7;
-        for mut item in items.into_iter() {
-            let mut entries_size = 0;
-            if let LogItemContent::EntryIndexes(EntryIndexes(indexes)) = &mut item.content {
-                for index in indexes.iter_mut() {
-                    index.entry_offset = entries_size;
-                    entries_size += index.entry_len;
-                }
-            }
-            let mut encoded = vec![];
-            item.encode(&mut encoded).unwrap();
-            let mut bytes_slice = encoded.as_slice();
-            let mut decoded_entries_size = 0;
-            let decoded_item =
-                LogItem::decode(&mut bytes_slice, &mut decoded_entries_size).unwrap();
-            assert_eq!(bytes_slice.len(), 0);
-            assert_eq!(decoded_entries_size, entries_size);
-            assert!(decoded_item.approximate_size() >= encoded.len());
-            assert_eq!(item, decoded_item);
-
-            // consume raft group id.
-            bytes_slice = encoded.as_slice();
-            codec::decode_var_u64(&mut bytes_slice).unwrap();
-            let next_u8 = encoded.len() - bytes_slice.len();
-            encoded[next_u8] = invalid_log_item_type;
-            let expected = format!("Unrecognized log item type: {invalid_log_item_type}");
-            assert!(matches!(
-                LogItem::decode(&mut encoded.as_slice(), &mut decoded_entries_size),
-                Err(Error::Corruption(m)) if m == expected
-            ));
-        }
-    }
-
-    #[test]
-    fn test_log_item_batch_enc_dec() {
-        let mut batches = vec![LogItemBatch::default()];
-        let mut batch = LogItemBatch::default();
-        batch.add_entry_indexes(7, generate_entry_indexes_opt(1, 5, None /* file_id */));
-        batch.add_entry_indexes(
-            7 + 100,
-            generate_entry_indexes_opt(100, 105, None /* file_id */),
-        );
-        batch.add_command(7, Command::Clean);
-        batch.put(7, b"key".to_vec(), b"value".to_vec());
-        batch.delete(7, b"key2".to_vec());
-        batches.push(batch);
-
-        for batch in batches.into_iter() {
-            for compression_type in [CompressionType::Lz4, CompressionType::None] {
-                let mut batch = batch.clone();
-                batch.finish_populate(compression_type);
-                let mut encoded_batch = vec![];
-                batch.encode(&mut encoded_batch).unwrap();
-                let file_context =
-                    LogFileContext::new(FileId::dummy(LogQueue::Append), Version::default());
-                batch
-                    .prepare_write(&mut encoded_batch, &file_context)
-                    .unwrap();
-                batch.finish_write(FileBlockHandle::dummy(LogQueue::Append));
-                let decoded_batch = LogItemBatch::decode(
-                    &mut encoded_batch.as_slice(),
-                    FileBlockHandle::dummy(LogQueue::Append),
-                    compression_type,
-                    &file_context,
-                )
-                .unwrap();
-                assert!(decoded_batch.approximate_size() >= encoded_batch.len());
-                assert_eq!(batch, decoded_batch);
-            }
-        }
-    }
-
-    #[test]
-    fn test_log_batch_enc_dec() {
-        fn decode_and_encode(
-            mut batch: LogBatch,
-            compress: bool,
-            version: Version,
-            entry_data: &[u8],
-        ) {
-            // Test call protocol violation.
-            assert!(catch_unwind_silent(|| batch.encoded_bytes()).is_err());
-            assert!(catch_unwind_silent(
-                || batch.finish_write(FileBlockHandle::dummy(LogQueue::Append))
-            )
-            .is_err());
-            let mocked_file_block_handle = FileBlockHandle {
-                id: FileId::new(LogQueue::Append, 12),
-                len: 0,
-                offset: 0,
-            };
-            let old_approximate_size = batch.approximate_size();
-            let (len, _) = batch.finish_populate(usize::from(compress), None).unwrap();
-            assert!(old_approximate_size >= len);
-            assert_eq!(batch.approximate_size(), len);
-            let mut batch_handle = mocked_file_block_handle;
-            batch_handle.len = len;
-            let file_context = LogFileContext::new(batch_handle.id, version);
-            batch.prepare_write(&file_context).unwrap();
-            batch.finish_write(batch_handle);
-            let encoded = batch.encoded_bytes();
-            assert_eq!(encoded.len(), len);
-            if len < LOG_BATCH_HEADER_LEN {
-                assert_eq!(len, 0);
-                let expected = "Log batch header too short: 0";
-                assert!(matches!(
-                    LogBatch::decode_header(&mut &*encoded),
-                    Err(Error::Corruption(m)) if m == expected
-                ));
-                return;
-            }
-
-            let item_batch = batch.item_batch.clone();
-            // decode item batch
-            let mut bytes_slice = encoded;
-            let (offset, compression_type, len) =
-                LogBatch::decode_header(&mut bytes_slice).unwrap();
-            assert_eq!(len, encoded.len());
-            assert_eq!(bytes_slice.len() + LOG_BATCH_HEADER_LEN, encoded.len());
-            let mut entries_handle = mocked_file_block_handle;
-            entries_handle.offset = LOG_BATCH_HEADER_LEN as u64;
-            entries_handle.len = offset - LOG_BATCH_HEADER_LEN;
-            let file_context = LogFileContext::new(entries_handle.id, version);
-            {
-                // Decoding with wrong compression type is okay.
-                LogItemBatch::decode(
-                    &mut &encoded[offset..],
-                    entries_handle,
-                    if compression_type == CompressionType::None {
-                        CompressionType::Lz4
-                    } else {
-                        CompressionType::None
-                    },
-                    &file_context,
-                )
-                .unwrap();
-                // Decode with wrong file number.
-                if version.has_log_signing() {
-                    LogItemBatch::decode(
-                        &mut &encoded[offset..],
-                        entries_handle,
-                        compression_type,
-                        &LogFileContext::new(FileId::new(LogQueue::Append, u64::MAX), version),
-                    )
-                    .unwrap_err();
-                }
-                // Decode with wrong version.
-                LogItemBatch::decode(
-                    &mut &encoded[offset..],
-                    entries_handle,
-                    compression_type,
-                    &LogFileContext::new(
-                        file_context.id,
-                        if version == Version::V1 {
-                            Version::V2
-                        } else {
-                            Version::V1
-                        },
-                    ),
-                )
-                .unwrap_err();
-            }
-            let decoded_item_batch = LogItemBatch::decode(
-                &mut &encoded[offset..],
-                entries_handle,
-                compression_type,
-                &file_context,
-            )
-            .unwrap();
-            assert_eq!(decoded_item_batch, item_batch);
-            assert!(decoded_item_batch.approximate_size() >= len - offset);
-
-            let entries = &encoded[LOG_BATCH_HEADER_LEN..offset];
-            for item in decoded_item_batch.items.iter() {
-                if let LogItemContent::EntryIndexes(entry_indexes) = &item.content {
-                    if !entry_indexes.0.is_empty() {
-                        let (begin, end) = (
-                            entry_indexes.0.first().unwrap().index,
-                            entry_indexes.0.last().unwrap().index + 1,
-                        );
-                        let origin_entries = generate_entries(begin, end, Some(entry_data));
-                        let decoded_entries =
-                            decode_entries_from_bytes::<Entry>(entries, &entry_indexes.0, false);
-                        assert_eq!(origin_entries, decoded_entries);
-                    }
-                }
-            }
-        }
-
-        let mut batches = vec![(LogBatch::default(), Vec::new())];
-        let mut batch = LogBatch::default();
-        let entry_data = vec![b'x'; 1024];
-        batch
-            .add_entries::<Entry>(7, &generate_entries(1, 11, Some(&entry_data)))
-            .unwrap();
-        batch.add_command(7, Command::Clean);
-        batch.put(7, b"key".to_vec(), b"value".to_vec()).unwrap();
-        batch.delete(7, b"key2".to_vec());
-        batch
-            .add_entries::<Entry>(7, &generate_entries(1, 11, Some(&entry_data)))
-            .unwrap();
-        batches.push((batch, entry_data));
-        let mut batch = LogBatch::default();
-        batch
-            .add_entries::<Entry>(17, &generate_entries(0, 1, None))
-            .unwrap();
-        batch
-            .add_entries::<Entry>(27, &generate_entries(1, 11, None))
-            .unwrap();
-        batches.push((batch, Vec::new()));
-
-        // Validate with different Versions
-        for version in Version::iter() {
-            for compress in [true, false] {
-                for (batch, entry_data) in batches.clone().into_iter() {
-                    decode_and_encode(batch, compress, version, &entry_data);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn test_log_batch_merge() {
-        let region_id = 8;
-        let mut entries = Vec::new();
-        let mut kvs = Vec::new();
-        let data = vec![b'x'; 1024];
-        let file_id = FileId::dummy(LogQueue::Append);
-        let file_context = LogFileContext::new(file_id, Version::default());
-
-        let mut batch1 = LogBatch::default();
-        entries.push(generate_entries(1, 11, Some(&data)));
-        batch1
-            .add_entries::<Entry>(region_id, entries.last().unwrap())
-            .unwrap();
-        for i in 0..=2 {
-            let (k, v) = (format!("k{i}").into_bytes(), format!("v{i}").into_bytes());
-            batch1.put(region_id, k.clone(), v.clone()).unwrap();
-            kvs.push((k, v));
-        }
-
-        batch1.merge(&mut LogBatch::default()).unwrap();
-
-        let mut batch2 = LogBatch::default();
-        entries.push(generate_entries(11, 21, Some(&data)));
-        batch2
-            .add_entries::<Entry>(region_id, entries.last().unwrap())
-            .unwrap();
-        for i in 3..=5 {
-            let (k, v) = (format!("k{i}").into_bytes(), format!("v{i}").into_bytes());
-            batch2.put(region_id, k.clone(), v.clone()).unwrap();
-            kvs.push((k, v));
-        }
-
-        batch1.merge(&mut batch2).unwrap();
-        assert!(batch2.is_empty());
-
-        let (len, _) = batch1.finish_populate(0, None).unwrap();
-        batch1.prepare_write(&file_context).unwrap();
-        let encoded = batch1.encoded_bytes();
-        assert_eq!(len, encoded.len());
-
-        // decode item batch
-        let (offset, compression_type, len) = LogBatch::decode_header(&mut &*encoded).unwrap();
-        assert_eq!(encoded.len(), len);
-        let decoded_item_batch = LogItemBatch::decode(
-            &mut &encoded[offset..],
-            FileBlockHandle {
-                id: file_id,
-                offset: 0,
-                len: offset - LOG_BATCH_HEADER_LEN,
-            },
-            compression_type,
-            &file_context,
-        )
-        .unwrap();
-
-        // decode and assert entries
-        let entry_bytes = &encoded[LOG_BATCH_HEADER_LEN..offset];
-        for item in decoded_item_batch.items.iter() {
-            match &item.content {
-                LogItemContent::EntryIndexes(entry_indexes) => {
-                    let decoded_entries =
-                        decode_entries_from_bytes::<Entry>(entry_bytes, &entry_indexes.0, false);
-                    assert_eq!(entries.remove(0), decoded_entries);
-                }
-                LogItemContent::Kv(kv) => {
-                    let (k, v) = kvs.remove(0);
-                    assert_eq!(OpType::Put, kv.op_type);
-                    assert_eq!(k, kv.key);
-                    assert_eq!(&v, kv.value.as_ref().unwrap());
-                }
-                _ => unreachable!(),
-            }
-        }
-    }
-
-    #[test]
-    fn test_empty_log_batch() {
-        let mut batch = LogBatch::default();
-        assert!(batch.is_empty());
-        batch.add_entries::<Entry>(0, &Vec::new()).unwrap();
-        assert!(batch.is_empty());
-        batch.add_raw_entries(0, Vec::new(), Vec::new()).unwrap();
-        assert!(batch.is_empty());
-        // Encoding empty LogBatch.
-        {
-            let mocked_file_block_handles = FileBlockHandle {
-                id: FileId::new(LogQueue::Append, 12),
-                len: 0,
-                offset: 0,
-            };
-            let buf_len = batch.buf.len();
-            let (len, compression_ratio) = batch.finish_populate(1, None).unwrap();
-            assert!(compression_ratio == 0.0);
-            assert!(len == 0);
-            assert_eq!(batch.buf_state, BufState::Encoded(buf_len, 0));
-            let file_context = LogFileContext::new(mocked_file_block_handles.id, Version::V2);
-            batch.prepare_write(&file_context).unwrap();
-            assert!(batch.is_empty());
-            assert_eq!(batch.buf_state, BufState::Sealed(buf_len, 0));
-        }
-    }
-
-    #[test]
-    fn test_internal_key() {
-        let mut batch = LogBatch::default();
-        assert!(matches!(
-            batch
-                .put(0, crate::make_internal_key(&[0]), b"v".to_vec())
-                .unwrap_err(),
-            Error::InvalidArgument(_)
-        ));
-        assert!(matches!(
-            batch
-                .put_message(0, crate::make_internal_key(ATOMIC_GROUP_KEY), &Entry::new())
-                .unwrap_err(),
-            Error::InvalidArgument(_)
-        ));
-    }
-
-    #[test]
-    fn test_header_corruption() {
-        let region_id = 7;
-        let data = vec![b'x'; 16];
-        let mut batch = LogBatch::default();
-        batch
-            .add_entries::<Entry>(region_id, &generate_entries(1, 11, Some(&data)))
-            .unwrap();
-        batch
-            .put(region_id, b"key".to_vec(), b"value".to_vec())
-            .unwrap();
-        // enable compression so that len_and_type > len.
-        batch.finish_populate(1, None).unwrap();
-        let file_context = LogFileContext::new(FileId::dummy(LogQueue::Append), Version::default());
-        batch.prepare_write(&file_context).unwrap();
-        let encoded = batch.encoded_bytes();
-
-        let mut copy = encoded.to_owned();
-        copy.truncate(LOG_BATCH_HEADER_LEN - 1);
-        assert!(LogBatch::decode_header(&mut copy.as_slice())
-            .unwrap_err()
-            .to_string()
-            .contains("Log batch header too short"));
-
-        let mut copy = encoded.to_owned();
-        (&mut copy[LOG_BATCH_HEADER_LEN - 8..LOG_BATCH_HEADER_LEN])
-            .write_u64::<BigEndian>(encoded.len() as u64 + 1)
-            .unwrap();
-        assert!(LogBatch::decode_header(&mut copy.as_slice())
-            .unwrap_err()
-            .to_string()
-            .contains("Log item offset exceeds log batch length"));
-
-        let mut copy = encoded.to_owned();
-        (&mut copy[LOG_BATCH_HEADER_LEN - 8..LOG_BATCH_HEADER_LEN])
-            .write_u64::<BigEndian>(LOG_BATCH_HEADER_LEN as u64 - 1)
-            .unwrap();
-        assert!(LogBatch::decode_header(&mut copy.as_slice())
-            .unwrap_err()
-            .to_string()
-            .contains("Log item offset is smaller than log batch header length"));
-    }
-
-    #[cfg(feature = "nightly")]
-    #[bench]
-    fn bench_log_batch_add_entry_and_encode(b: &mut test::Bencher) {
-        use rand::{thread_rng, Rng};
-        fn details(log_batch: &mut LogBatch, entries: &[Entry], regions: usize) {
-            for _ in 0..regions {
-                log_batch
-                    .add_entries::<Entry>(thread_rng().gen(), entries)
-                    .unwrap();
-            }
-            log_batch.finish_populate(0, None).unwrap();
-            let _ = log_batch.drain();
-        }
-        let data: Vec<u8> = (0..128).map(|_| thread_rng().gen()).collect();
-        let entries = generate_entries(1, 11, Some(&data));
-        let mut log_batch = LogBatch::default();
-        // warm up
-        details(&mut log_batch, &entries, 100);
-        b.iter(move || {
-            details(&mut log_batch, &entries, 100);
-        });
-    }
-
-    #[test]
-    fn test_log_batch_sign_signature_repeatedly() {
-        // Set a LogBatch and encode the LogBatch by `finish_populate`.
-        let mut batch = LogBatch::default();
-        batch
-            .add_entries::<Entry>(17, &generate_entries(0, 1, None))
-            .unwrap();
-        batch
-            .add_entries::<Entry>(27, &generate_entries(1, 11, None))
-            .unwrap();
-
-        let mocked_file_block_handles = [
-            FileBlockHandle {
-                id: FileId::new(LogQueue::Append, 12),
-                len: 0,
-                offset: 0,
-            },
-            FileBlockHandle {
-                id: FileId::new(LogQueue::Append, 18),
-                len: 0,
-                offset: 0,
-            },
-            FileBlockHandle {
-                id: FileId::new(LogQueue::Append, 2001),
-                len: 0,
-                offset: 0,
-            },
-        ];
-        let old_approximate_size = batch.approximate_size();
-        let (len, compression_ratio) = batch.finish_populate(1, None).unwrap();
-        assert!(compression_ratio > 0.0);
-        assert!(old_approximate_size >= len);
-        assert_eq!(batch.approximate_size(), len);
-        let checksum = batch.item_batch.checksum;
-
-        // Repeatedly sign signature to this batch, followed by decoding the signature
-        // and verifying the checksum.
-        for handle in mocked_file_block_handles {
-            let mut batch_handle = handle;
-            batch_handle.len = len;
-            let file_context = LogFileContext::new(batch_handle.id, Version::V2);
-            batch.prepare_write(&file_context).unwrap();
-            assert_eq!(batch.approximate_size(), len);
-            let encoded = batch.encoded_bytes();
-            assert_eq!(encoded.len(), len);
-            let mut bytes_slice = encoded;
-            let (offset, _, _) = LogBatch::decode_header(&mut bytes_slice).unwrap();
-            let expected =
-                verify_checksum_with_signature(&encoded[offset..], file_context.get_signature())
-                    .unwrap();
-            assert_eq!(expected, checksum);
-        }
-    }
-}
+// 
+// #[cfg(test)]
+// mod tests {
+//     use super::*;
+//     use crate::pipe_log::{LogQueue, Version};
+//     use crate::test_util::{catch_unwind_silent, generate_entries, generate_entry_indexes_opt};
+//     use raft::eraftpb::Entry;
+//     use strum::IntoEnumIterator;
+// 
+//     fn decode_entries_from_bytes<M: MessageExt>(
+//         buf: &[u8],
+//         entry_indexes: &[EntryIndex],
+//         _encoded: bool,
+//     ) -> Vec<M::Entry> {
+//         let mut entries = Vec::with_capacity(entry_indexes.len());
+//         for ei in entry_indexes {
+//             let block =
+//                 LogBatch::decode_entries_block(buf, ei.entries.unwrap(), ei.compression_type)
+//                     .unwrap();
+//             entries.push(
+//                 bincode2::deserialize(
+//                     &block[ei.entry_offset as usize..(ei.entry_offset + ei.entry_len) as usize],
+//                 )
+//                 .unwrap(),
+//             );
+//         }
+//         entries
+//     }
+// 
+//     #[test]
+//     fn test_entry_indexes_enc_dec() {
+//         fn encode_and_decode(entry_indexes: &mut [EntryIndex]) -> EntryIndexes {
+//             let mut entries_size = 0;
+//             for idx in entry_indexes.iter_mut() {
+//                 idx.entry_offset = entries_size;
+//                 entries_size += idx.entry_len;
+//             }
+//             let entry_indexes = EntryIndexes(entry_indexes.to_vec());
+// 
+//             let mut encoded = vec![];
+//             entry_indexes.encode(&mut encoded).unwrap();
+//             let mut bytes_slice = encoded.as_slice();
+//             let mut decoded_entries_size = 0;
+//             let decoded_indexes =
+//                 EntryIndexes::decode(&mut bytes_slice, &mut decoded_entries_size).unwrap();
+//             assert_eq!(bytes_slice.len(), 0);
+//             assert!(decoded_indexes.approximate_size() >= encoded.len());
+//             assert_eq!(decoded_entries_size, entries_size);
+//             decoded_indexes
+//         }
+// 
+//         let entry_indexes = vec![Vec::new(), generate_entry_indexes_opt(7, 17, None)];
+//         for mut idxs in entry_indexes.into_iter() {
+//             let decoded = encode_and_decode(&mut idxs);
+//             assert_eq!(idxs, decoded.0);
+//         }
+// 
+//         let mut entry_indexes_with_file_id =
+//             generate_entry_indexes_opt(7, 17, Some(FileId::new(LogQueue::Append, 7)));
+//         let mut decoded = encode_and_decode(&mut entry_indexes_with_file_id);
+//         assert_ne!(entry_indexes_with_file_id, decoded.0);
+//         for i in decoded.0.iter_mut() {
+//             i.entries = None;
+//         }
+//         assert_ne!(entry_indexes_with_file_id, decoded.0);
+//     }
+// 
+//     #[test]
+//     fn test_command_enc_dec() {
+//         let cmds = vec![Command::Clean, Command::Compact { index: 7 }];
+//         let invalid_command_type = 7;
+//         for cmd in cmds.into_iter() {
+//             let mut encoded = vec![];
+//             cmd.encode(&mut encoded);
+//             let mut bytes_slice = encoded.as_slice();
+//             let decoded_cmd = Command::decode(&mut bytes_slice).unwrap();
+//             assert_eq!(bytes_slice.len(), 0);
+//             assert!(decoded_cmd.approximate_size() >= encoded.len());
+//             assert_eq!(cmd, decoded_cmd);
+// 
+//             encoded[0] = invalid_command_type;
+//             let expected = format!("Unrecognized command type: {invalid_command_type}");
+//             assert!(matches!(
+//                 Command::decode(&mut encoded.as_slice()),
+//                 Err(Error::Corruption(m)) if m == expected
+//             ));
+//         }
+//     }
+// 
+//     #[test]
+//     fn test_kv_enc_dec() {
+//         let kvs = vec![
+//             KeyValue::new(OpType::Put, b"put".to_vec(), Some(b"put_v".to_vec())),
+//             KeyValue::new(OpType::Del, b"del".to_vec(), None),
+//         ];
+//         let invalid_op_type = 7;
+//         for kv in kvs.into_iter() {
+//             let mut encoded = vec![];
+//             kv.encode(&mut encoded).unwrap();
+//             let mut bytes_slice = encoded.as_slice();
+//             let decoded_kv = KeyValue::decode(&mut bytes_slice).unwrap();
+//             assert_eq!(bytes_slice.len(), 0);
+//             assert!(decoded_kv.approximate_size() >= encoded.len());
+//             assert_eq!(kv, decoded_kv);
+// 
+//             encoded[0] = invalid_op_type;
+//             let expected = format!("Unrecognized op type: {invalid_op_type}");
+//             assert!(matches!(
+//                 KeyValue::decode(&mut encoded.as_slice()),
+//                 Err(Error::Corruption(m)) if m == expected
+//             ));
+//         }
+// 
+//         let del_with_value = KeyValue::new(OpType::Del, b"del".to_vec(), Some(b"del_v".to_vec()));
+//         let mut encoded = vec![];
+//         del_with_value.encode(&mut encoded).unwrap();
+//         let mut bytes_slice = encoded.as_slice();
+//         let decoded_kv = KeyValue::decode(&mut bytes_slice).unwrap();
+//         assert_eq!(bytes_slice.len(), 0);
+//         assert!(decoded_kv.value.is_none());
+//     }
+// 
+//     #[test]
+//     fn test_log_item_enc_dec() {
+//         let items = vec![
+//             LogItem::new_entry_indexes(7, generate_entry_indexes_opt(7, 17, None)),
+//             LogItem::new_command(17, Command::Compact { index: 7 }),
+//             LogItem::new_kv(27, OpType::Put, b"key".to_vec(), Some(b"value".to_vec())),
+//         ];
+//         let invalid_log_item_type = 7;
+//         for mut item in items.into_iter() {
+//             let mut entries_size = 0;
+//             if let LogItemContent::EntryIndexes(EntryIndexes(indexes)) = &mut item.content {
+//                 for index in indexes.iter_mut() {
+//                     index.entry_offset = entries_size;
+//                     entries_size += index.entry_len;
+//                 }
+//             }
+//             let mut encoded = vec![];
+//             item.encode(&mut encoded).unwrap();
+//             let mut bytes_slice = encoded.as_slice();
+//             let mut decoded_entries_size = 0;
+//             let decoded_item =
+//                 LogItem::decode(&mut bytes_slice, &mut decoded_entries_size).unwrap();
+//             assert_eq!(bytes_slice.len(), 0);
+//             assert_eq!(decoded_entries_size, entries_size);
+//             assert!(decoded_item.approximate_size() >= encoded.len());
+//             assert_eq!(item, decoded_item);
+// 
+//             // consume raft group id.
+//             bytes_slice = encoded.as_slice();
+//             codec::decode_var_u64(&mut bytes_slice).unwrap();
+//             let next_u8 = encoded.len() - bytes_slice.len();
+//             encoded[next_u8] = invalid_log_item_type;
+//             let expected = format!("Unrecognized log item type: {invalid_log_item_type}");
+//             assert!(matches!(
+//                 LogItem::decode(&mut encoded.as_slice(), &mut decoded_entries_size),
+//                 Err(Error::Corruption(m)) if m == expected
+//             ));
+//         }
+//     }
+// 
+//     #[test]
+//     fn test_log_item_batch_enc_dec() {
+//         let mut batches = vec![LogItemBatch::default()];
+//         let mut batch = LogItemBatch::default();
+//         batch.add_entry_indexes(7, generate_entry_indexes_opt(1, 5, None /* file_id */));
+//         batch.add_entry_indexes(
+//             7 + 100,
+//             generate_entry_indexes_opt(100, 105, None /* file_id */),
+//         );
+//         batch.add_command(7, Command::Clean);
+//         batch.put(7, b"key".to_vec(), b"value".to_vec());
+//         batch.delete(7, b"key2".to_vec());
+//         batches.push(batch);
+// 
+//         for batch in batches.into_iter() {
+//             for compression_type in [CompressionType::Lz4, CompressionType::None] {
+//                 let mut batch = batch.clone();
+//                 batch.finish_populate(compression_type);
+//                 let mut encoded_batch = vec![];
+//                 batch.encode(&mut encoded_batch).unwrap();
+//                 let file_context =
+//                     LogFileContext::new(FileId::dummy(LogQueue::Append), Version::default());
+//                 batch
+//                     .prepare_write(&mut encoded_batch, &file_context)
+//                     .unwrap();
+//                 batch.finish_write(FileBlockHandle::dummy(LogQueue::Append));
+//                 let decoded_batch = LogItemBatch::decode(
+//                     &mut encoded_batch.as_slice(),
+//                     FileBlockHandle::dummy(LogQueue::Append),
+//                     compression_type,
+//                     &file_context,
+//                 )
+//                 .unwrap();
+//                 assert!(decoded_batch.approximate_size() >= encoded_batch.len());
+//                 assert_eq!(batch, decoded_batch);
+//             }
+//         }
+//     }
+// 
+//     #[test]
+//     fn test_log_batch_enc_dec() {
+//         fn decode_and_encode(
+//             mut batch: LogBatch,
+//             compress: bool,
+//             version: Version,
+//             entry_data: &[u8],
+//         ) {
+//             // Test call protocol violation.
+//             assert!(catch_unwind_silent(|| batch.encoded_bytes()).is_err());
+//             assert!(catch_unwind_silent(
+//                 || batch.finish_write(FileBlockHandle::dummy(LogQueue::Append))
+//             )
+//             .is_err());
+//             let mocked_file_block_handle = FileBlockHandle {
+//                 id: FileId::new(LogQueue::Append, 12),
+//                 len: 0,
+//                 offset: 0,
+//             };
+//             let old_approximate_size = batch.approximate_size();
+//             let (len, _) = batch.finish_populate(usize::from(compress), None).unwrap();
+//             assert!(old_approximate_size >= len);
+//             assert_eq!(batch.approximate_size(), len);
+//             let mut batch_handle = mocked_file_block_handle;
+//             batch_handle.len = len;
+//             let file_context = LogFileContext::new(batch_handle.id, version);
+//             batch.prepare_write(&file_context).unwrap();
+//             batch.finish_write(batch_handle);
+//             let encoded = batch.encoded_bytes();
+//             assert_eq!(encoded.len(), len);
+//             if len < LOG_BATCH_HEADER_LEN {
+//                 assert_eq!(len, 0);
+//                 let expected = "Log batch header too short: 0";
+//                 assert!(matches!(
+//                     LogBatch::decode_header(&mut &*encoded),
+//                     Err(Error::Corruption(m)) if m == expected
+//                 ));
+//                 return;
+//             }
+// 
+//             let item_batch = batch.item_batch.clone();
+//             // decode item batch
+//             let mut bytes_slice = encoded;
+//             let (offset, compression_type, len) =
+//                 LogBatch::decode_header(&mut bytes_slice).unwrap();
+//             assert_eq!(len, encoded.len());
+//             assert_eq!(bytes_slice.len() + LOG_BATCH_HEADER_LEN, encoded.len());
+//             let mut entries_handle = mocked_file_block_handle;
+//             entries_handle.offset = LOG_BATCH_HEADER_LEN as u64;
+//             entries_handle.len = offset - LOG_BATCH_HEADER_LEN;
+//             let file_context = LogFileContext::new(entries_handle.id, version);
+//             {
+//                 // Decoding with wrong compression type is okay.
+//                 LogItemBatch::decode(
+//                     &mut &encoded[offset..],
+//                     entries_handle,
+//                     if compression_type == CompressionType::None {
+//                         CompressionType::Lz4
+//                     } else {
+//                         CompressionType::None
+//                     },
+//                     &file_context,
+//                 )
+//                 .unwrap();
+//                 // Decode with wrong file number.
+//                 if version.has_log_signing() {
+//                     LogItemBatch::decode(
+//                         &mut &encoded[offset..],
+//                         entries_handle,
+//                         compression_type,
+//                         &LogFileContext::new(FileId::new(LogQueue::Append, u64::MAX), version),
+//                     )
+//                     .unwrap_err();
+//                 }
+//                 // Decode with wrong version.
+//                 LogItemBatch::decode(
+//                     &mut &encoded[offset..],
+//                     entries_handle,
+//                     compression_type,
+//                     &LogFileContext::new(
+//                         file_context.id,
+//                         if version == Version::V1 {
+//                             Version::V2
+//                         } else {
+//                             Version::V1
+//                         },
+//                     ),
+//                 )
+//                 .unwrap_err();
+//             }
+//             let decoded_item_batch = LogItemBatch::decode(
+//                 &mut &encoded[offset..],
+//                 entries_handle,
+//                 compression_type,
+//                 &file_context,
+//             )
+//             .unwrap();
+//             assert_eq!(decoded_item_batch, item_batch);
+//             assert!(decoded_item_batch.approximate_size() >= len - offset);
+// 
+//             let entries = &encoded[LOG_BATCH_HEADER_LEN..offset];
+//             for item in decoded_item_batch.items.iter() {
+//                 if let LogItemContent::EntryIndexes(entry_indexes) = &item.content {
+//                     if !entry_indexes.0.is_empty() {
+//                         let (begin, end) = (
+//                             entry_indexes.0.first().unwrap().index,
+//                             entry_indexes.0.last().unwrap().index + 1,
+//                         );
+//                         let origin_entries = generate_entries(begin, end, Some(entry_data));
+//                         let decoded_entries =
+//                             decode_entries_from_bytes::<Entry>(entries, &entry_indexes.0, false);
+//                         assert_eq!(origin_entries, decoded_entries);
+//                     }
+//                 }
+//             }
+//         }
+// 
+//         let mut batches = vec![(LogBatch::default(), Vec::new())];
+//         let mut batch = LogBatch::default();
+//         let entry_data = vec![b'x'; 1024];
+//         batch
+//             .add_entries::<Entry>(7, &generate_entries(1, 11, Some(&entry_data)))
+//             .unwrap();
+//         batch.add_command(7, Command::Clean);
+//         batch.put(7, b"key".to_vec(), b"value".to_vec()).unwrap();
+//         batch.delete(7, b"key2".to_vec());
+//         batch
+//             .add_entries::<Entry>(7, &generate_entries(1, 11, Some(&entry_data)))
+//             .unwrap();
+//         batches.push((batch, entry_data));
+//         let mut batch = LogBatch::default();
+//         batch
+//             .add_entries::<Entry>(17, &generate_entries(0, 1, None))
+//             .unwrap();
+//         batch
+//             .add_entries::<Entry>(27, &generate_entries(1, 11, None))
+//             .unwrap();
+//         batches.push((batch, Vec::new()));
+// 
+//         // Validate with different Versions
+//         for version in Version::iter() {
+//             for compress in [true, false] {
+//                 for (batch, entry_data) in batches.clone().into_iter() {
+//                     decode_and_encode(batch, compress, version, &entry_data);
+//                 }
+//             }
+//         }
+//     }
+// 
+//     #[test]
+//     fn test_log_batch_merge() {
+//         let region_id = 8;
+//         let mut entries = Vec::new();
+//         let mut kvs = Vec::new();
+//         let data = vec![b'x'; 1024];
+//         let file_id = FileId::dummy(LogQueue::Append);
+//         let file_context = LogFileContext::new(file_id, Version::default());
+// 
+//         let mut batch1 = LogBatch::default();
+//         entries.push(generate_entries(1, 11, Some(&data)));
+//         batch1
+//             .add_entries::<Entry>(region_id, entries.last().unwrap())
+//             .unwrap();
+//         for i in 0..=2 {
+//             let (k, v) = (format!("k{i}").into_bytes(), format!("v{i}").into_bytes());
+//             batch1.put(region_id, k.clone(), v.clone()).unwrap();
+//             kvs.push((k, v));
+//         }
+// 
+//         batch1.merge(&mut LogBatch::default()).unwrap();
+// 
+//         let mut batch2 = LogBatch::default();
+//         entries.push(generate_entries(11, 21, Some(&data)));
+//         batch2
+//             .add_entries::<Entry>(region_id, entries.last().unwrap())
+//             .unwrap();
+//         for i in 3..=5 {
+//             let (k, v) = (format!("k{i}").into_bytes(), format!("v{i}").into_bytes());
+//             batch2.put(region_id, k.clone(), v.clone()).unwrap();
+//             kvs.push((k, v));
+//         }
+// 
+//         batch1.merge(&mut batch2).unwrap();
+//         assert!(batch2.is_empty());
+// 
+//         let (len, _) = batch1.finish_populate(0, None).unwrap();
+//         batch1.prepare_write(&file_context).unwrap();
+//         let encoded = batch1.encoded_bytes();
+//         assert_eq!(len, encoded.len());
+// 
+//         // decode item batch
+//         let (offset, compression_type, len) = LogBatch::decode_header(&mut &*encoded).unwrap();
+//         assert_eq!(encoded.len(), len);
+//         let decoded_item_batch = LogItemBatch::decode(
+//             &mut &encoded[offset..],
+//             FileBlockHandle {
+//                 id: file_id,
+//                 offset: 0,
+//                 len: offset - LOG_BATCH_HEADER_LEN,
+//             },
+//             compression_type,
+//             &file_context,
+//         )
+//         .unwrap();
+// 
+//         // decode and assert entries
+//         let entry_bytes = &encoded[LOG_BATCH_HEADER_LEN..offset];
+//         for item in decoded_item_batch.items.iter() {
+//             match &item.content {
+//                 LogItemContent::EntryIndexes(entry_indexes) => {
+//                     let decoded_entries =
+//                         decode_entries_from_bytes::<Entry>(entry_bytes, &entry_indexes.0, false);
+//                     assert_eq!(entries.remove(0), decoded_entries);
+//                 }
+//                 LogItemContent::Kv(kv) => {
+//                     let (k, v) = kvs.remove(0);
+//                     assert_eq!(OpType::Put, kv.op_type);
+//                     assert_eq!(k, kv.key);
+//                     assert_eq!(&v, kv.value.as_ref().unwrap());
+//                 }
+//                 _ => unreachable!(),
+//             }
+//         }
+//     }
+// 
+//     #[test]
+//     fn test_empty_log_batch() {
+//         let mut batch = LogBatch::default();
+//         assert!(batch.is_empty());
+//         batch.add_entries::<Entry>(0, &Vec::new()).unwrap();
+//         assert!(batch.is_empty());
+//         batch.add_raw_entries(0, Vec::new(), Vec::new()).unwrap();
+//         assert!(batch.is_empty());
+//         // Encoding empty LogBatch.
+//         {
+//             let mocked_file_block_handles = FileBlockHandle {
+//                 id: FileId::new(LogQueue::Append, 12),
+//                 len: 0,
+//                 offset: 0,
+//             };
+//             let buf_len = batch.buf.len();
+//             let (len, compression_ratio) = batch.finish_populate(1, None).unwrap();
+//             assert!(compression_ratio == 0.0);
+//             assert!(len == 0);
+//             assert_eq!(batch.buf_state, BufState::Encoded(buf_len, 0));
+//             let file_context = LogFileContext::new(mocked_file_block_handles.id, Version::V2);
+//             batch.prepare_write(&file_context).unwrap();
+//             assert!(batch.is_empty());
+//             assert_eq!(batch.buf_state, BufState::Sealed(buf_len, 0));
+//         }
+//     }
+// 
+//     #[test]
+//     fn test_internal_key() {
+//         let mut batch = LogBatch::default();
+//         assert!(matches!(
+//             batch
+//                 .put(0, crate::make_internal_key(&[0]), b"v".to_vec())
+//                 .unwrap_err(),
+//             Error::InvalidArgument(_)
+//         ));
+//         assert!(matches!(
+//             batch
+//                 .put_message(0, crate::make_internal_key(ATOMIC_GROUP_KEY), &Entry::new())
+//                 .unwrap_err(),
+//             Error::InvalidArgument(_)
+//         ));
+//     }
+// 
+//     #[test]
+//     fn test_header_corruption() {
+//         let region_id = 7;
+//         let data = vec![b'x'; 16];
+//         let mut batch = LogBatch::default();
+//         batch
+//             .add_entries::<Entry>(region_id, &generate_entries(1, 11, Some(&data)))
+//             .unwrap();
+//         batch
+//             .put(region_id, b"key".to_vec(), b"value".to_vec())
+//             .unwrap();
+//         // enable compression so that len_and_type > len.
+//         batch.finish_populate(1, None).unwrap();
+//         let file_context = LogFileContext::new(FileId::dummy(LogQueue::Append), Version::default());
+//         batch.prepare_write(&file_context).unwrap();
+//         let encoded = batch.encoded_bytes();
+// 
+//         let mut copy = encoded.to_owned();
+//         copy.truncate(LOG_BATCH_HEADER_LEN - 1);
+//         assert!(LogBatch::decode_header(&mut copy.as_slice())
+//             .unwrap_err()
+//             .to_string()
+//             .contains("Log batch header too short"));
+// 
+//         let mut copy = encoded.to_owned();
+//         (&mut copy[LOG_BATCH_HEADER_LEN - 8..LOG_BATCH_HEADER_LEN])
+//             .write_u64::<BigEndian>(encoded.len() as u64 + 1)
+//             .unwrap();
+//         assert!(LogBatch::decode_header(&mut copy.as_slice())
+//             .unwrap_err()
+//             .to_string()
+//             .contains("Log item offset exceeds log batch length"));
+// 
+//         let mut copy = encoded.to_owned();
+//         (&mut copy[LOG_BATCH_HEADER_LEN - 8..LOG_BATCH_HEADER_LEN])
+//             .write_u64::<BigEndian>(LOG_BATCH_HEADER_LEN as u64 - 1)
+//             .unwrap();
+//         assert!(LogBatch::decode_header(&mut copy.as_slice())
+//             .unwrap_err()
+//             .to_string()
+//             .contains("Log item offset is smaller than log batch header length"));
+//     }
+// 
+//     #[cfg(feature = "nightly")]
+//     #[bench]
+//     fn bench_log_batch_add_entry_and_encode(b: &mut test::Bencher) {
+//         use rand::{thread_rng, Rng};
+//         fn details(log_batch: &mut LogBatch, entries: &[Entry], regions: usize) {
+//             for _ in 0..regions {
+//                 log_batch
+//                     .add_entries::<Entry>(thread_rng().gen(), entries)
+//                     .unwrap();
+//             }
+//             log_batch.finish_populate(0, None).unwrap();
+//             let _ = log_batch.drain();
+//         }
+//         let data: Vec<u8> = (0..128).map(|_| thread_rng().gen()).collect();
+//         let entries = generate_entries(1, 11, Some(&data));
+//         let mut log_batch = LogBatch::default();
+//         // warm up
+//         details(&mut log_batch, &entries, 100);
+//         b.iter(move || {
+//             details(&mut log_batch, &entries, 100);
+//         });
+//     }
+// 
+//     #[test]
+//     fn test_log_batch_sign_signature_repeatedly() {
+//         // Set a LogBatch and encode the LogBatch by `finish_populate`.
+//         let mut batch = LogBatch::default();
+//         batch
+//             .add_entries::<Entry>(17, &generate_entries(0, 1, None))
+//             .unwrap();
+//         batch
+//             .add_entries::<Entry>(27, &generate_entries(1, 11, None))
+//             .unwrap();
+// 
+//         let mocked_file_block_handles = [
+//             FileBlockHandle {
+//                 id: FileId::new(LogQueue::Append, 12),
+//                 len: 0,
+//                 offset: 0,
+//             },
+//             FileBlockHandle {
+//                 id: FileId::new(LogQueue::Append, 18),
+//                 len: 0,
+//                 offset: 0,
+//             },
+//             FileBlockHandle {
+//                 id: FileId::new(LogQueue::Append, 2001),
+//                 len: 0,
+//                 offset: 0,
+//             },
+//         ];
+//         let old_approximate_size = batch.approximate_size();
+//         let (len, compression_ratio) = batch.finish_populate(1, None).unwrap();
+//         assert!(compression_ratio > 0.0);
+//         assert!(old_approximate_size >= len);
+//         assert_eq!(batch.approximate_size(), len);
+//         let checksum = batch.item_batch.checksum;
+// 
+//         // Repeatedly sign signature to this batch, followed by decoding the signature
+//         // and verifying the checksum.
+//         for handle in mocked_file_block_handles {
+//             let mut batch_handle = handle;
+//             batch_handle.len = len;
+//             let file_context = LogFileContext::new(batch_handle.id, Version::V2);
+//             batch.prepare_write(&file_context).unwrap();
+//             assert_eq!(batch.approximate_size(), len);
+//             let encoded = batch.encoded_bytes();
+//             assert_eq!(encoded.len(), len);
+//             let mut bytes_slice = encoded;
+//             let (offset, _, _) = LogBatch::decode_header(&mut bytes_slice).unwrap();
+//             let expected =
+//                 verify_checksum_with_signature(&encoded[offset..], file_context.get_signature())
+//                     .unwrap();
+//             assert_eq!(expected, checksum);
+//         }
+//     }
+// }

@@ -1,25 +1,46 @@
 // Copyright (c) 2017-present, PingCAP, Inc. Licensed under Apache-2.0.
 
-use kvproto::raft_serverpb::RaftLocalState;
-use raft::eraftpb::Entry;
 use raft_engine::{Config, Engine, LogBatch, MessageExt, ReadableSize};
 use rand::thread_rng;
 use rand_distr::{Distribution, Normal};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct EntryI {
+    index: u64,
+    data: Vec<u8>,
+}
+impl EntryI {
+    fn new() -> Self {
+        EntryI {
+            index: 0,
+            data: vec![],
+        }
+    }
+    fn set_data(&mut self, data: Vec<u8>) {
+        self.data = data;
+    }
+}
 
 #[derive(Clone)]
 pub struct MessageExtTyped;
-
 impl MessageExt for MessageExtTyped {
-    type Entry = Entry;
+    type Entry = EntryI;
 
     fn index(e: &Self::Entry) -> u64 {
         e.index
     }
 }
 
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct RaftLocalState {
+    last_index: u64,
+}
+
 // How to run the example:
 // $ RUST_LOG=debug cargo run --release --example append-compact-purge
 fn main() {
+
     env_logger::init();
 
     let config = Config {
@@ -42,7 +63,7 @@ fn main() {
         .map(|x| x as u64);
 
     let mut batch = LogBatch::with_capacity(256);
-    let mut entry = Entry::new();
+    let mut entry = EntryI::new();
     entry.set_data(vec![b'x'; 1024 * 32].into());
     let init_state = RaftLocalState {
         last_index: 0,

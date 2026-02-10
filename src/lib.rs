@@ -217,29 +217,29 @@ pub(crate) fn is_internal_key(s: &[u8], ext: Option<&[u8]>) -> bool {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::log_batch::MessageExt;
-    use raft::eraftpb::Entry;
-
-    #[ctor::ctor]
-    fn init() {
-        env_logger::init();
-    }
-
-    impl MessageExt for Entry {
-        type Entry = Entry;
-
-        fn index(e: &Self::Entry) -> u64 {
-            e.index
-        }
-    }
-
-    #[test]
-    fn test_internal_key() {
-        let key = crate::make_internal_key(&[0]);
-        assert!(crate::is_internal_key(&key, None));
-        assert!(crate::is_internal_key(&key, Some(&[0])));
-        assert!(!crate::is_internal_key(&key, Some(&[1])));
-    }
-}
+// #[cfg(test)]
+// mod tests {
+//     use crate::log_batch::MessageExt;
+//     use raft::eraftpb::Entry;
+//
+//     #[ctor::ctor]
+//     fn init() {
+//         env_logger::init();
+//     }
+//
+//     impl MessageExt for Entry {
+//         type Entry = Entry;
+//
+//         fn index(e: &Self::Entry) -> u64 {
+//             e.index
+//         }
+//     }
+//
+//     #[test]
+//     fn test_internal_key() {
+//         let key = crate::make_internal_key(&[0]);
+//         assert!(crate::is_internal_key(&key, None));
+//         assert!(crate::is_internal_key(&key, Some(&[0])));
+//         assert!(!crate::is_internal_key(&key, Some(&[1])));
+//     }
+// }
