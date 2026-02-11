@@ -40,16 +40,16 @@ struct RaftLocalState {
 // How to run the example:
 // $ RUST_LOG=debug cargo run --release --example append-compact-purge
 fn main() {
-
     env_logger::init();
 
     let config = Config {
-        dir: "append-compact-purge-data".to_owned(),
+        dir: "E:/tmp/raft/raft-engine".to_owned(),
         purge_threshold: ReadableSize::gb(2),
         batch_compression_threshold: ReadableSize::kb(0),
         ..Default::default()
     };
     let engine = Engine::open(config).expect("Open raft engine");
+    let mut res = Vec::new();
 
     let compact_offset = 32; // In src/purge.rs, it's the limit for rewrite.
 
@@ -69,6 +69,15 @@ fn main() {
         last_index: 0,
         ..Default::default()
     };
+    match engine.last_index(0) {
+        None => {}
+        Some(_) => {
+            println!(
+                "[EXAMPLE] last_index {0} = {}",
+                engine.last_index(0).unwrap()
+            );
+        }
+    }
     loop {
         for _ in 0..1024 {
             let region = rand_regions.next().unwrap();
@@ -85,6 +94,9 @@ fn main() {
                 .put_message(region, b"last_index".to_vec(), &state)
                 .unwrap();
             engine.write(&mut batch, false).unwrap();
+            engine
+                .fetch_entries_to::<MessageExtTyped>(region, state.last_index, state.last_index+1, None, &mut res)
+                .unwrap();
 
             if state.last_index % compact_offset == 0 {
                 let rand_compact_offset = rand_compacts.next().unwrap();
@@ -95,6 +107,7 @@ fn main() {
                 }
             }
         }
+
         for region in engine.purge_expired_files().unwrap() {
             let state = engine
                 .get_message::<RaftLocalState>(region, b"last_index")

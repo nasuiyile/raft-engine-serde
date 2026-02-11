@@ -11,13 +11,13 @@ use byteorder::{BigEndian, LittleEndian, ReadBytesExt, WriteBytesExt};
 use log::error;
 use num_derive::FromPrimitive;
 use num_traits::FromPrimitive;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use std::io::BufRead;
 use std::mem;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use serde::de::DeserializeOwned;
 
 pub(crate) const LOG_BATCH_HEADER_LEN: usize = 16;
 pub(crate) const LOG_BATCH_CHECKSUM_LEN: usize = 4;
@@ -38,7 +38,7 @@ const MAX_LOG_ENTRIES_SIZE_PER_BATCH: usize = i32::MAX as usize;
 /// protobuf messages.
 
 pub trait MessageExt: Send + Sync {
-    type Entry: Serialize + DeserializeOwned + Clone + PartialEq;
+    type Entry: Serialize + DeserializeOwned + Clone;
     /// 仍然保留 index 语义（Raft entry index）
     fn index(e: &Self::Entry) -> u64;
 }
@@ -1115,7 +1115,7 @@ impl AtomicGroupBuilder {
         Self { id, status: None }
     }
 }
-// 
+//
 // #[cfg(test)]
 // mod tests {
 //     use super::*;
@@ -1123,7 +1123,7 @@ impl AtomicGroupBuilder {
 //     use crate::test_util::{catch_unwind_silent, generate_entries, generate_entry_indexes_opt};
 //     use raft::eraftpb::Entry;
 //     use strum::IntoEnumIterator;
-// 
+//
 //     fn decode_entries_from_bytes<M: MessageExt>(
 //         buf: &[u8],
 //         entry_indexes: &[EntryIndex],
@@ -1143,7 +1143,7 @@ impl AtomicGroupBuilder {
 //         }
 //         entries
 //     }
-// 
+//
 //     #[test]
 //     fn test_entry_indexes_enc_dec() {
 //         fn encode_and_decode(entry_indexes: &mut [EntryIndex]) -> EntryIndexes {
@@ -1153,7 +1153,7 @@ impl AtomicGroupBuilder {
 //                 entries_size += idx.entry_len;
 //             }
 //             let entry_indexes = EntryIndexes(entry_indexes.to_vec());
-// 
+//
 //             let mut encoded = vec![];
 //             entry_indexes.encode(&mut encoded).unwrap();
 //             let mut bytes_slice = encoded.as_slice();
@@ -1165,13 +1165,13 @@ impl AtomicGroupBuilder {
 //             assert_eq!(decoded_entries_size, entries_size);
 //             decoded_indexes
 //         }
-// 
+//
 //         let entry_indexes = vec![Vec::new(), generate_entry_indexes_opt(7, 17, None)];
 //         for mut idxs in entry_indexes.into_iter() {
 //             let decoded = encode_and_decode(&mut idxs);
 //             assert_eq!(idxs, decoded.0);
 //         }
-// 
+//
 //         let mut entry_indexes_with_file_id =
 //             generate_entry_indexes_opt(7, 17, Some(FileId::new(LogQueue::Append, 7)));
 //         let mut decoded = encode_and_decode(&mut entry_indexes_with_file_id);
@@ -1181,7 +1181,7 @@ impl AtomicGroupBuilder {
 //         }
 //         assert_ne!(entry_indexes_with_file_id, decoded.0);
 //     }
-// 
+//
 //     #[test]
 //     fn test_command_enc_dec() {
 //         let cmds = vec![Command::Clean, Command::Compact { index: 7 }];
@@ -1194,7 +1194,7 @@ impl AtomicGroupBuilder {
 //             assert_eq!(bytes_slice.len(), 0);
 //             assert!(decoded_cmd.approximate_size() >= encoded.len());
 //             assert_eq!(cmd, decoded_cmd);
-// 
+//
 //             encoded[0] = invalid_command_type;
 //             let expected = format!("Unrecognized command type: {invalid_command_type}");
 //             assert!(matches!(
@@ -1203,7 +1203,7 @@ impl AtomicGroupBuilder {
 //             ));
 //         }
 //     }
-// 
+//
 //     #[test]
 //     fn test_kv_enc_dec() {
 //         let kvs = vec![
@@ -1219,7 +1219,7 @@ impl AtomicGroupBuilder {
 //             assert_eq!(bytes_slice.len(), 0);
 //             assert!(decoded_kv.approximate_size() >= encoded.len());
 //             assert_eq!(kv, decoded_kv);
-// 
+//
 //             encoded[0] = invalid_op_type;
 //             let expected = format!("Unrecognized op type: {invalid_op_type}");
 //             assert!(matches!(
@@ -1227,7 +1227,7 @@ impl AtomicGroupBuilder {
 //                 Err(Error::Corruption(m)) if m == expected
 //             ));
 //         }
-// 
+//
 //         let del_with_value = KeyValue::new(OpType::Del, b"del".to_vec(), Some(b"del_v".to_vec()));
 //         let mut encoded = vec![];
 //         del_with_value.encode(&mut encoded).unwrap();
@@ -1236,7 +1236,7 @@ impl AtomicGroupBuilder {
 //         assert_eq!(bytes_slice.len(), 0);
 //         assert!(decoded_kv.value.is_none());
 //     }
-// 
+//
 //     #[test]
 //     fn test_log_item_enc_dec() {
 //         let items = vec![
@@ -1263,7 +1263,7 @@ impl AtomicGroupBuilder {
 //             assert_eq!(decoded_entries_size, entries_size);
 //             assert!(decoded_item.approximate_size() >= encoded.len());
 //             assert_eq!(item, decoded_item);
-// 
+//
 //             // consume raft group id.
 //             bytes_slice = encoded.as_slice();
 //             codec::decode_var_u64(&mut bytes_slice).unwrap();
@@ -1276,7 +1276,7 @@ impl AtomicGroupBuilder {
 //             ));
 //         }
 //     }
-// 
+//
 //     #[test]
 //     fn test_log_item_batch_enc_dec() {
 //         let mut batches = vec![LogItemBatch::default()];
@@ -1290,7 +1290,7 @@ impl AtomicGroupBuilder {
 //         batch.put(7, b"key".to_vec(), b"value".to_vec());
 //         batch.delete(7, b"key2".to_vec());
 //         batches.push(batch);
-// 
+//
 //         for batch in batches.into_iter() {
 //             for compression_type in [CompressionType::Lz4, CompressionType::None] {
 //                 let mut batch = batch.clone();
@@ -1315,7 +1315,7 @@ impl AtomicGroupBuilder {
 //             }
 //         }
 //     }
-// 
+//
 //     #[test]
 //     fn test_log_batch_enc_dec() {
 //         fn decode_and_encode(
@@ -1355,7 +1355,7 @@ impl AtomicGroupBuilder {
 //                 ));
 //                 return;
 //             }
-// 
+//
 //             let item_batch = batch.item_batch.clone();
 //             // decode item batch
 //             let mut bytes_slice = encoded;
@@ -1415,7 +1415,7 @@ impl AtomicGroupBuilder {
 //             .unwrap();
 //             assert_eq!(decoded_item_batch, item_batch);
 //             assert!(decoded_item_batch.approximate_size() >= len - offset);
-// 
+//
 //             let entries = &encoded[LOG_BATCH_HEADER_LEN..offset];
 //             for item in decoded_item_batch.items.iter() {
 //                 if let LogItemContent::EntryIndexes(entry_indexes) = &item.content {
@@ -1432,7 +1432,7 @@ impl AtomicGroupBuilder {
 //                 }
 //             }
 //         }
-// 
+//
 //         let mut batches = vec![(LogBatch::default(), Vec::new())];
 //         let mut batch = LogBatch::default();
 //         let entry_data = vec![b'x'; 1024];
@@ -1454,7 +1454,7 @@ impl AtomicGroupBuilder {
 //             .add_entries::<Entry>(27, &generate_entries(1, 11, None))
 //             .unwrap();
 //         batches.push((batch, Vec::new()));
-// 
+//
 //         // Validate with different Versions
 //         for version in Version::iter() {
 //             for compress in [true, false] {
@@ -1464,7 +1464,7 @@ impl AtomicGroupBuilder {
 //             }
 //         }
 //     }
-// 
+//
 //     #[test]
 //     fn test_log_batch_merge() {
 //         let region_id = 8;
@@ -1473,7 +1473,7 @@ impl AtomicGroupBuilder {
 //         let data = vec![b'x'; 1024];
 //         let file_id = FileId::dummy(LogQueue::Append);
 //         let file_context = LogFileContext::new(file_id, Version::default());
-// 
+//
 //         let mut batch1 = LogBatch::default();
 //         entries.push(generate_entries(1, 11, Some(&data)));
 //         batch1
@@ -1484,9 +1484,9 @@ impl AtomicGroupBuilder {
 //             batch1.put(region_id, k.clone(), v.clone()).unwrap();
 //             kvs.push((k, v));
 //         }
-// 
+//
 //         batch1.merge(&mut LogBatch::default()).unwrap();
-// 
+//
 //         let mut batch2 = LogBatch::default();
 //         entries.push(generate_entries(11, 21, Some(&data)));
 //         batch2
@@ -1497,15 +1497,15 @@ impl AtomicGroupBuilder {
 //             batch2.put(region_id, k.clone(), v.clone()).unwrap();
 //             kvs.push((k, v));
 //         }
-// 
+//
 //         batch1.merge(&mut batch2).unwrap();
 //         assert!(batch2.is_empty());
-// 
+//
 //         let (len, _) = batch1.finish_populate(0, None).unwrap();
 //         batch1.prepare_write(&file_context).unwrap();
 //         let encoded = batch1.encoded_bytes();
 //         assert_eq!(len, encoded.len());
-// 
+//
 //         // decode item batch
 //         let (offset, compression_type, len) = LogBatch::decode_header(&mut &*encoded).unwrap();
 //         assert_eq!(encoded.len(), len);
@@ -1520,7 +1520,7 @@ impl AtomicGroupBuilder {
 //             &file_context,
 //         )
 //         .unwrap();
-// 
+//
 //         // decode and assert entries
 //         let entry_bytes = &encoded[LOG_BATCH_HEADER_LEN..offset];
 //         for item in decoded_item_batch.items.iter() {
@@ -1540,7 +1540,7 @@ impl AtomicGroupBuilder {
 //             }
 //         }
 //     }
-// 
+//
 //     #[test]
 //     fn test_empty_log_batch() {
 //         let mut batch = LogBatch::default();
@@ -1567,7 +1567,7 @@ impl AtomicGroupBuilder {
 //             assert_eq!(batch.buf_state, BufState::Sealed(buf_len, 0));
 //         }
 //     }
-// 
+//
 //     #[test]
 //     fn test_internal_key() {
 //         let mut batch = LogBatch::default();
@@ -1584,7 +1584,7 @@ impl AtomicGroupBuilder {
 //             Error::InvalidArgument(_)
 //         ));
 //     }
-// 
+//
 //     #[test]
 //     fn test_header_corruption() {
 //         let region_id = 7;
@@ -1601,14 +1601,14 @@ impl AtomicGroupBuilder {
 //         let file_context = LogFileContext::new(FileId::dummy(LogQueue::Append), Version::default());
 //         batch.prepare_write(&file_context).unwrap();
 //         let encoded = batch.encoded_bytes();
-// 
+//
 //         let mut copy = encoded.to_owned();
 //         copy.truncate(LOG_BATCH_HEADER_LEN - 1);
 //         assert!(LogBatch::decode_header(&mut copy.as_slice())
 //             .unwrap_err()
 //             .to_string()
 //             .contains("Log batch header too short"));
-// 
+//
 //         let mut copy = encoded.to_owned();
 //         (&mut copy[LOG_BATCH_HEADER_LEN - 8..LOG_BATCH_HEADER_LEN])
 //             .write_u64::<BigEndian>(encoded.len() as u64 + 1)
@@ -1617,7 +1617,7 @@ impl AtomicGroupBuilder {
 //             .unwrap_err()
 //             .to_string()
 //             .contains("Log item offset exceeds log batch length"));
-// 
+//
 //         let mut copy = encoded.to_owned();
 //         (&mut copy[LOG_BATCH_HEADER_LEN - 8..LOG_BATCH_HEADER_LEN])
 //             .write_u64::<BigEndian>(LOG_BATCH_HEADER_LEN as u64 - 1)
@@ -1627,7 +1627,7 @@ impl AtomicGroupBuilder {
 //             .to_string()
 //             .contains("Log item offset is smaller than log batch header length"));
 //     }
-// 
+//
 //     #[cfg(feature = "nightly")]
 //     #[bench]
 //     fn bench_log_batch_add_entry_and_encode(b: &mut test::Bencher) {
@@ -1650,7 +1650,7 @@ impl AtomicGroupBuilder {
 //             details(&mut log_batch, &entries, 100);
 //         });
 //     }
-// 
+//
 //     #[test]
 //     fn test_log_batch_sign_signature_repeatedly() {
 //         // Set a LogBatch and encode the LogBatch by `finish_populate`.
@@ -1661,7 +1661,7 @@ impl AtomicGroupBuilder {
 //         batch
 //             .add_entries::<Entry>(27, &generate_entries(1, 11, None))
 //             .unwrap();
-// 
+//
 //         let mocked_file_block_handles = [
 //             FileBlockHandle {
 //                 id: FileId::new(LogQueue::Append, 12),
@@ -1685,7 +1685,7 @@ impl AtomicGroupBuilder {
 //         assert!(old_approximate_size >= len);
 //         assert_eq!(batch.approximate_size(), len);
 //         let checksum = batch.item_batch.checksum;
-// 
+//
 //         // Repeatedly sign signature to this batch, followed by decoding the signature
 //         // and verifying the checksum.
 //         for handle in mocked_file_block_handles {
