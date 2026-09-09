@@ -897,6 +897,101 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_entries_with_non_protobuf_codec() {
+        use crate::value_codec::test_codecs::{RawCodec, RawEntry, RawExt};
+        let dir = tempfile::Builder::new()
+            .prefix("test_entries_with_non_protobuf_codec")
+            .tempdir()
+            .unwrap();
+        let cfg = Config {
+            dir: dir.path().to_str().unwrap().to_owned(),
+            target_file_size: ReadableSize::kb(4),
+            batch_compression_threshold: ReadableSize::kb(1),
+            ..Default::default()
+        };
+        let engine = RaftLogEngine::open(cfg).unwrap();
+        let entries: Vec<RawEntry> = (1..21).map(|i| RawEntry::new(i, 512)).collect();
+        for rid in 1..=3 {
+            let mut batch = LogBatch::default();
+            batch
+                .add_entries_with::<RawExt, RawCodec>(rid, &entries)
+                .unwrap();
+            batch
+                .put_value::<RawCodec, RawEntry>(rid, b"state".to_vec(), &entries[19])
+                .unwrap();
+            engine.write(&mut batch, true).unwrap();
+        }
+        let check = |engine: &RaftLogEngine| {
+            for rid in 1..=3 {
+                assert_eq!(engine.first_index(rid), Some(1));
+                assert_eq!(engine.last_index(rid), Some(20));
+                for e in &entries {
+                    assert_eq!(
+                        engine
+                            .get_entry_with::<RawExt, RawCodec>(rid, e.index)
+                            .unwrap()
+                            .as_ref(),
+                        Some(e)
+                    );
+                }
+                let mut fetched = Vec::new();
+                let n = engine
+                    .fetch_entries_to_with::<RawExt, RawCodec>(rid, 1, 21, None, &mut fetched)
+                    .unwrap();
+                assert_eq!(n, entries.len());
+                assert_eq!(fetched, entries);
+                assert_eq!(
+                    engine
+                        .get_value::<RawEntry, RawCodec>(rid, b"state")
+                        .unwrap()
+                        .as_ref(),
+                    Some(&entries[19])
+                );
+            }
+        };
+        check(&engine);
+        // ... and again after recovery.
+        let engine = engine.reopen();
+        check(&engine);
+    }
+    #[test]
+    fn test_read_entry_reports_index_mismatch() {
+        use crate::value_codec::test_codecs::{RawCodec, RawEntry, RawExt, RawExtWrongIndex};
+        let dir = tempfile::Builder::new()
+            .prefix("test_read_entry_reports_index_mismatch")
+            .tempdir()
+            .unwrap();
+        let cfg = Config {
+            dir: dir.path().to_str().unwrap().to_owned(),
+            ..Default::default()
+        };
+        let engine = RaftLogEngine::open(cfg).unwrap();
+        let entries: Vec<RawEntry> = (1..6).map(|i| RawEntry::new(i, 32)).collect();
+        let mut batch = LogBatch::default();
+        batch
+            .add_entries_with::<RawExt, RawCodec>(1, &entries)
+            .unwrap();
+        engine.write(&mut batch, true).unwrap();
+        match engine.get_entry_with::<RawExtWrongIndex, RawCodec>(1, 3) {
+            Err(Error::Corruption(msg)) => {
+                assert!(msg.contains("index mismatch"), "unexpected message: {msg}");
+                assert!(
+                    msg.contains("value codec"),
+                    "message should hint at the codec: {msg}"
+                );
+            }
+            other => panic!("expected Error::Corruption, got {other:?}"),
+        }
+        assert_eq!(
+            engine
+                .get_entry_with::<RawExt, RawCodec>(1, 3)
+                .unwrap()
+                .as_ref(),
+            Some(&entries[2])
+        );
+    }
+
+    #[test]
     fn test_clean_raft_group() {
         fn run_steps(steps: &[Option<(u64, u64)>]) {
             let rid = 1;

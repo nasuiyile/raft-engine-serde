@@ -1672,6 +1672,52 @@ mod tests {
         }
         assert_eq!(&batch.buf[LOG_BATCH_HEADER_LEN..], &expected[..]);
     }
+    #[test]
+    fn test_add_entries_restores_state_on_codec_error() {
+        use crate::value_codec::test_codecs::{FAILING_INDEX, FailExt, FailingCodec, RawEntry};
+        let mut batch = LogBatch::default();
+        let first = generate_entries(1, 4, Some(&[b'p'; 24]));
+        batch.add_entries::<Entry>(7, &first).unwrap();
+        let buf_len_before = batch.buf.len();
+        let items_before = batch.item_batch.items.len();
+        assert!(buf_len_before > LOG_BATCH_HEADER_LEN);
+        let mixed = [
+            RawEntry::new(1, 8),
+            RawEntry::new(2, 8),
+            RawEntry::new(FAILING_INDEX, 8),
+        ];
+        assert!(
+            batch
+                .add_entries_with::<FailExt, FailingCodec>(1, &mixed)
+                .is_err()
+        );
+        assert_eq!(batch.buf_state, BufState::Open);
+        assert_eq!(
+            batch.buf.len(),
+            buf_len_before,
+            "rollback ate the wrong range"
+        );
+        assert_eq!(batch.item_batch.items.len(), items_before);
+        let second = generate_entries(10, 15, Some(&[b'q'; 32]));
+        batch.add_entries::<Entry>(8, &second).unwrap();
+        let mut decoded = Vec::new();
+        for item in &batch.item_batch.items {
+            if let LogItemContent::EntryIndexes(eis) = &item.content {
+                for ei in &eis.0 {
+                    let s = LOG_BATCH_HEADER_LEN + ei.entry_offset as usize;
+                    let e = s + ei.entry_len as usize;
+                    decoded.push(ProtobufCodec::decode(&batch.buf[s..e]).ok());
+                }
+            }
+        }
+        let expected: Vec<Option<Entry>> = first
+            .iter()
+            .chain(second.iter())
+            .cloned()
+            .map(Some)
+            .collect();
+        assert_eq!(decoded, expected, "entry offsets desynced from the buffer");
+    }
 
     #[test]
     fn test_header_corruption() {

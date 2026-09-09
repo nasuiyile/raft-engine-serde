@@ -127,6 +127,87 @@ where
 }
 
 #[cfg(test)]
+pub(crate) mod test_codecs {
+    use super::*;
+    use crate::log_batch::MessageExt;
+    #[derive(Clone, Debug, Default, PartialEq)]
+    pub(crate) struct RawEntry {
+        pub index: u64,
+        pub data: Vec<u8>,
+    }
+    impl RawEntry {
+        pub(crate) fn new(index: u64, data_len: usize) -> Self {
+            RawEntry {
+                index,
+                data: vec![(index % 251) as u8; data_len],
+            }
+        }
+    }
+    pub(crate) struct RawCodec;
+    impl ValueCodec<RawEntry> for RawCodec {
+        fn encode_to(v: &RawEntry, buf: &mut Vec<u8>) -> Result<()> {
+            buf.extend_from_slice(&v.index.to_le_bytes());
+            buf.extend_from_slice(&v.data);
+            Ok(())
+        }
+        fn decode(bytes: &[u8]) -> Result<RawEntry> {
+            if bytes.len() < 8 {
+                return Err(box_err!("raw codec: input too short"));
+            }
+            Ok(RawEntry {
+                index: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+                data: bytes[8..].to_owned(),
+            })
+        }
+    }
+
+    pub(crate) struct FailingCodec;
+
+    impl ValueCodec<RawEntry> for FailingCodec {
+        fn encode_to(v: &RawEntry, buf: &mut Vec<u8>) -> Result<()> {
+            if v.index == FAILING_INDEX {
+                buf.extend_from_slice(b"PARTIAL-GARBAGE");
+                return Err(box_err!("codec blew up"));
+            }
+            RawCodec::encode_to(v, buf)
+        }
+
+        fn decode(bytes: &[u8]) -> Result<RawEntry> {
+            RawCodec::decode(bytes)
+        }
+    }
+    pub(crate) const FAILING_INDEX: u64 = u64::MAX;
+
+    pub(crate) struct RawExt;
+
+    impl MessageExt<RawCodec> for RawExt {
+        type Entry = RawEntry;
+
+        fn index(e: &Self::Entry) -> u64 {
+            e.index
+        }
+    }
+
+    pub(crate) struct RawExtWrongIndex;
+
+    impl MessageExt<RawCodec> for RawExtWrongIndex {
+        type Entry = RawEntry;
+        fn index(e: &Self::Entry) -> u64 {
+            e.index + 1
+        }
+    }
+
+    pub(crate) struct FailExt;
+
+    impl MessageExt<FailingCodec> for FailExt {
+        type Entry = RawEntry;
+        fn index(e: &Self::Entry) -> u64 {
+            e.index
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use protobuf::Message;
